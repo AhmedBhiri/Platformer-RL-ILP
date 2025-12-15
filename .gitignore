@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# Logs & generated data
+data/
+*.log
+*.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Popper output
+results/
