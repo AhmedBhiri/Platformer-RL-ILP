@@ -6,15 +6,32 @@ __pycache__/
 .env
 .venv
 venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
 # Logs & generated data
 data/
 *.log
 *.json
+ilp/
+logs/
+*.jsonl
 
 # OS junk
 .DS_Store
 Thumbs.db
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+*.egg-info/
+dist/
+build/
+
 
 # Popper output
 results/

@@ -1,1 +1,12 @@
-pygame>=2.5
+
+pygame
+clingo
+bitarray
+backports.tarfile
+python-sat[pblib,aiger]
+
+# ILP / Prolog bridge
+janus-swi
+
+# Stability (Popper warning mitigation)
+setuptools<81
