@@ -1,12 +1,17 @@
-
-pygame
-clingo
-bitarray
-backports.tarfile
-python-sat[pblib,aiger]
-
-# ILP / Prolog bridge
-janus-swi
-
-# Stability (Popper warning mitigation)
-setuptools<81
+attrs==25.4.0
+backports.tarfile==1.2.0
+bidict==0.22.1
+bitarray==3.8.0
+cffi==2.0.0
+clingo==5.8.0
+funcy==1.18
+janus_swi==1.5.2
+py-aiger==6.2.3
+py-aiger-cnf==5.0.8
+pycparser==2.23
+pygame==2.6.1
+pypblib==0.0.4
+pyrsistent==0.19.3
+python-sat==1.8.dev25
+six==1.17.0
+sortedcontainers==2.4.0
