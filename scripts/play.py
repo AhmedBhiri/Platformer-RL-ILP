@@ -6,7 +6,6 @@ from .logger import JsonlLogger, obs_to_dict
 
 from game.env import PlatformerEnv, Action, Tile
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", type=str, default=None,

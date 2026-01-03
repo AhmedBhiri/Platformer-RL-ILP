@@ -22,10 +22,11 @@ def dist_to_atom(d: Optional[int]) -> str:
     return str(d) if d is not None else "far"
 
 
-def run_episode(env: PlatformerEnv, policy_eps: float, rng: random.Random) -> Tuple[int, List[Example]]:
+def run_episode(env: PlatformerEnv, policy_eps: float, rng: random.Random, episode_id: int) -> Tuple[int, List[Example]]:
     """
     Runs one episode, returns (distance_travelled, examples).
     policy_eps: epsilon for random exploration.
+    episode_id: unique episode identifier to ensure unique state IDs.
     """
     obs = env.reset()
     examples: List[Example] = []
@@ -40,7 +41,8 @@ def run_episode(env: PlatformerEnv, policy_eps: float, rng: random.Random) -> Tu
             # baseline "current policy" (initially simple, later replaced by ILP rules)
             action = simple_policy(obs)
 
-        state_id = f"s{env.t:06d}_{step_idx:04d}"
+        # Include episode_id to make state IDs globally unique
+        state_id = f"s{episode_id:04d}_{step_idx:04d}"
         step_idx += 1
 
         step = env.step(action)
@@ -91,61 +93,76 @@ def write_popper_files(examples: List[Example], out_dir: str) -> None:
     exs_path = os.path.join(out_dir, "exs.pl")
     bias_path = os.path.join(out_dir, "bias.pl")
 
+    # Deduplicate examples: for BK facts, we only need one per state_id
+    # For examples, we need to handle conflicts (same state+action with different labels)
+    seen_states = {}  # state_id -> (enemy_dist, gap_dist, on_ground)
+    example_labels = {}  # (state_id, action) -> {"pos": count, "neg": count}
+
+    for ex in examples:
+        # Track state facts (should be consistent for the same state_id now)
+        if ex.state_id not in seen_states:
+            seen_states[ex.state_id] = (ex.enemy_dist, ex.gap_dist, ex.on_ground)
+        
+        # Track example labels
+        key = (ex.state_id, ex.action)
+        if key not in example_labels:
+            example_labels[key] = {"pos": 0, "neg": 0}
+        example_labels[key][ex.label] += 1
+
     # --- Background knowledge ---
-    # Keep it minimal for now: distances and boolean ground.
     with open(bk_path, "w", encoding="utf-8") as f:
         f.write("% Background knowledge\n")
         f.write("dist(1). dist(2). dist(3). dist(far).\n")
         f.write("near(1). near(2).\n")
         f.write("far(far).\n\n")
 
-        # State facts
-        for ex in examples:
-            f.write(f"enemy_dist({ex.state_id},{ex.enemy_dist}).\n")
-            f.write(f"gap_dist({ex.state_id},{ex.gap_dist}).\n")
-            f.write(
-                f"on_ground({ex.state_id},{'true' if ex.on_ground else 'false'}).\n")
+        # State facts (deduplicated)
+        for state_id, (enemy_dist, gap_dist, on_ground) in sorted(seen_states.items()):
+            f.write(f"enemy_dist({state_id},{enemy_dist}).\n")
+            f.write(f"gap_dist({state_id},{gap_dist}).\n")
+            f.write(f"on_ground({state_id},{'true' if on_ground else 'false'}).\n")
+            # Add derived predicates for specific conditions
+            if enemy_dist == "1":
+                f.write(f"enemy_near({state_id}).\n")
+            if gap_dist == "1":
+                f.write(f"gap_near({state_id}).\n")
+            if on_ground:
+                f.write(f"grounded({state_id}).\n")
 
     # --- Examples ---
+    # Resolve conflicts: if both pos and neg exist, skip that example (ambiguous)
+    # Create separate predicates for each action: should_attack, should_jump, should_do_nothing
     with open(exs_path, "w", encoding="utf-8") as f:
-        for ex in examples:
-            if ex.label == "pos":
-                f.write(f"pos(good_action({ex.state_id},{ex.action})).\n")
+        skipped = 0
+        for (state_id, action), counts in sorted(example_labels.items()):
+            if counts["pos"] > 0 and counts["neg"] > 0:
+                # Conflict - skip this example
+                skipped += 1
+                continue
+            # Map action to predicate name
+            action_pred = f"should_{action}"  # e.g., should_attack, should_jump
+            if counts["pos"] > 0:
+                f.write(f"pos({action_pred}({state_id})).\n")
             else:
-                f.write(f"neg(good_action({ex.state_id},{ex.action})).\n")
+                f.write(f"neg({action_pred}({state_id})).\n")
+        if skipped > 0:
+            print(f"Warning: Skipped {skipped} conflicting examples")
 
     # --- Bias (Popper) ---
-    # This is a conservative bias; we can tune later.
+    # Use separate head predicates for each action
     with open(bias_path, "w", encoding="utf-8") as f:
         f.write("% Popper bias\n")
-        f.write("head_pred(good_action,2).\n")
+        f.write("max_body(3).\n")
+        f.write("max_vars(4).\n\n")
+        
+        f.write("head_pred(should_attack,1).\n")
+        f.write("head_pred(should_jump,1).\n")
+        f.write("body_pred(enemy_near,1).\n")
+        f.write("body_pred(gap_near,1).\n")
+        f.write("body_pred(grounded,1).\n")
         f.write("body_pred(enemy_dist,2).\n")
         f.write("body_pred(gap_dist,2).\n")
         f.write("body_pred(on_ground,2).\n")
-        f.write("body_pred(near,1).\n")
-        f.write("body_pred(far,1).\n\n")
-
-        f.write("type(good_action,(state,action)).\n")
-        f.write("type(enemy_dist,(state,dist)).\n")
-        f.write("type(gap_dist,(state,dist)).\n")
-        f.write("type(on_ground,(state,bool)).\n")
-        f.write("type(near,(dist,)).\n")
-        f.write("type(far,(dist,)).\n\n")
-
-        f.write("direction(good_action,(in,in)).\n")
-        f.write("direction(enemy_dist,(in,out)).\n")
-        f.write("direction(gap_dist,(in,out)).\n")
-        f.write("direction(on_ground,(in,out)).\n")
-        f.write("direction(near,(in,)).\n")
-        f.write("direction(far,(in,)).\n\n")
-
-        # allow these constants as actions
-        f.write("action(do_nothing).\n")
-        f.write("action(jump).\n")
-        f.write("action(attack).\n\n")
-
-        f.write("max_body(4).\n")
-        f.write("max_vars(6).\n")
 
 
 def main():
@@ -171,7 +188,7 @@ def main():
     distances: List[int] = []
 
     for ep in range(args.episodes):
-        dist, exs = run_episode(env, policy_eps=args.epsilon, rng=rng)
+        dist, exs = run_episode(env, policy_eps=args.epsilon, rng=rng, episode_id=ep)
         distances.append(dist)
         all_examples.extend(exs)
 
@@ -183,8 +200,11 @@ def main():
 
     if args.run_popper:
         # This assumes you cloned Popper somewhere; adjust popper path accordingly.
-        cmd = ["python3", args.popper_path, args.out]
+        import sys
+        cmd = [sys.executable, args.popper_path, args.out]
         print("Running Popper:", " ".join(cmd))
+        # Note: Popper uses SIGALRM which is Unix-only.
+        # On Windows, you may need to run Popper in WSL or patch loop.py
         subprocess.run(cmd, check=False)
 
 
