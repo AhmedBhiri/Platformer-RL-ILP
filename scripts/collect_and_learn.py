@@ -1,191 +1,273 @@
+from __future__ import annotations
+
 import argparse
-import os
 import random
 import subprocess
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import sys
+from dataclasses import is_dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-from game.env import PlatformerEnv, Action, Event
+# Allow running as a script: `python scripts/collect_and_learn.py ...`
+# while still being able to import `game.*`
+if __package__ is None or __package__ == "":
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
 
-
-@dataclass
-class Example:
-    state_id: str
-    enemy_dist: str
-    gap_dist: str
-    on_ground: bool
-    action: str
-    label: str  # "pos" or "neg"
-
-
-def dist_to_atom(d: Optional[int]) -> str:
-    return str(d) if d is not None else "far"
+from game.env import PlatformerEnv, Action  # noqa: E402
 
 
-def run_episode(env: PlatformerEnv, policy_eps: float, rng: random.Random) -> Tuple[int, List[Example]]:
+# -----------------------------
+# Helpers
+# -----------------------------
+def obs_to_dict(obs: Any) -> Dict[str, Any]:
+    if is_dataclass(obs):
+        return asdict(obs)
+    if hasattr(obs, "__dict__"):
+        return dict(obs.__dict__)
+    return {"obs": str(obs)}
+
+
+def dist_value(x: Any) -> int:
     """
-    Runs one episode, returns (distance_travelled, examples).
-    policy_eps: epsilon for random exploration.
+    Ensure distances become integers in BK.
+    Your env might use ints or strings like 'far'. We normalize:
+      - int -> int
+      - 'far' -> 99
+      - None -> 99
     """
-    obs = env.reset()
-    examples: List[Example] = []
-    step_idx = 0
+    if x is None:
+        return 99
+    if isinstance(x, bool):
+        return 1 if x else 0
+    if isinstance(x, int):
+        return x
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s == "far":
+            return 99
+        if s == "near":
+            return 1
+        try:
+            return int(s)
+        except ValueError:
+            return 99
+    return 99
 
-    while True:
-        # epsilon-greedy: random action sometimes
-        if rng.random() < policy_eps:
-            action = rng.choice(
-                [Action.DO_NOTHING, Action.JUMP, Action.ATTACK])
+
+def action_to_atom(a: Action) -> str:
+    if a == Action.DO_NOTHING:
+        return "do_nothing"
+    if a == Action.JUMP:
+        return "jump"
+    if a == Action.ATTACK:
+        return "attack"
+    # fallback
+    return str(a).lower().replace(".", "_")
+
+
+def choose_action_random(rng: random.Random) -> Action:
+    return rng.choice([Action.DO_NOTHING, Action.JUMP, Action.ATTACK])
+
+
+# -----------------------------
+# Data collection
+# -----------------------------
+def collect_dataset(
+    episodes: int,
+    seed: int,
+    max_steps_per_ep: int,
+) -> Tuple[List[Tuple[str, str, bool]], Dict[str, Dict[str, Any]]]:
+    """
+    Returns:
+      exs: list of (state_id, action_atom, is_positive)
+      bk:  dict state_id -> features dict
+    """
+    rng = random.Random(seed)
+
+    env = PlatformerEnv(seed=seed, length=300, lookahead=10,
+                        p_gap=0.08, p_enemy=0.08)
+
+    # Global unique state id counter across ALL episodes
+    global_state_counter = 0
+
+    # To guarantee: never output same (state,action) twice, and never both pos+neg
+    seen_label: Dict[Tuple[str, str], bool] = {}
+
+    exs: List[Tuple[str, str, bool]] = []
+    bk: Dict[str, Dict[str, Any]] = {}
+
+    for ep in range(episodes):
+        obs = env.reset()
+
+        for _t in range(max_steps_per_ep):
+            state_id = f"s{global_state_counter:09d}"
+            global_state_counter += 1
+
+            # Snapshot features for BK for THIS state_id
+            od = obs_to_dict(obs)
+            enemy_d = dist_value(od.get("enemy_dist"))
+            gap_d = dist_value(od.get("gap_dist"))
+            on_ground = bool(od.get("on_ground", False))
+
+            bk[state_id] = {
+                "enemy_dist": enemy_d,
+                "gap_dist": gap_d,
+                "on_ground": on_ground,
+            }
+
+            # Random behavior policy (for now)
+            act = choose_action_random(rng)
+            act_atom = action_to_atom(act)
+
+            step = env.step(act)
+            obs = step.obs
+
+            # Label rule:
+            # - treat strictly positive reward as "good_action"
+            # - everything else as negative
+            is_pos = bool(step.reward > 0)
+
+            key = (state_id, act_atom)
+
+            # This line makes contradictions impossible:
+            # If we ever revisit the SAME (state,action) (shouldn't happen with unique state_id),
+            # we force consistency (and do not duplicate lines).
+            if key in seen_label:
+                # If somehow it differs, keep the first label and skip the new one.
+                if seen_label[key] != is_pos:
+                    continue
+                else:
+                    continue
+
+            seen_label[key] = is_pos
+            exs.append((state_id, act_atom, is_pos))
+
+            if step.done:
+                break
+
+    return exs, bk
+
+
+# -----------------------------
+# Writing Popper task
+# -----------------------------
+def write_task(out_dir: Path, exs: List[Tuple[str, str, bool]], bk: Dict[str, Dict[str, Any]]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bias_pl = out_dir / "bias.pl"
+    bk_pl = out_dir / "bk.pl"
+    exs_pl = out_dir / "exs.pl"
+
+    # ---- bias.pl ----
+    # NOTE: unary predicate types/directions MUST be (dist) and (in), not (dist,) / (in,)
+    bias_pl.write_text(
+        "\n".join(
+            [
+                "% Popper bias",
+                "head_pred(good_action,2).",
+                "body_pred(enemy_dist,2).",
+                "body_pred(gap_dist,2).",
+                "body_pred(on_ground,2).",
+                "body_pred(near,1).",
+                "body_pred(far,1).",
+                "",
+                "type(good_action,(state,action)).",
+                "type(enemy_dist,(state,dist)).",
+                "type(gap_dist,(state,dist)).",
+                "type(on_ground,(state,bool)).",
+                "type(near,(dist)).",
+                "type(far,(dist)).",
+                "",
+                "direction(good_action,(in,in)).",
+                "direction(enemy_dist,(in,out)).",
+                "direction(gap_dist,(in,out)).",
+                "direction(on_ground,(in,out)).",
+                "direction(near,(in)).",
+                "direction(far,(in)).",
+                "",
+                "action(do_nothing).",
+                "action(jump).",
+                "action(attack).",
+                "",
+                "max_body(4).",
+                "max_vars(6).",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
+    # ---- bk.pl ----
+    # Suppress discontiguous warnings completely (Popper's recall parser can get upset by warnings/noise).
+    lines = [
+        ":- discontiguous enemy_dist/2.",
+        ":- discontiguous gap_dist/2.",
+        ":- discontiguous on_ground/2.",
+        "",
+        "% distance buckets",
+        "near(D) :- integer(D), D =< 1.",
+        "far(D)  :- integer(D), D >= 2.",
+        "",
+    ]
+    for sid, feats in bk.items():
+        lines.append(f"enemy_dist({sid},{feats['enemy_dist']}).")
+        lines.append(f"gap_dist({sid},{feats['gap_dist']}).")
+        lines.append(
+            f"on_ground({sid},{'true' if feats['on_ground'] else 'false'}).")
+    bk_pl.write_text("\n".join(lines) + "\n")
+
+    # ---- exs.pl ----
+    # Write in two blocks (all pos, then all neg) so SWI doesn't warn about discontiguous pos/neg.
+    pos_lines = []
+    neg_lines = []
+    for sid, act_atom, is_pos in exs:
+        lit = f"good_action({sid},{act_atom})"
+        if is_pos:
+            pos_lines.append(f"pos({lit}).")
         else:
-            # baseline "current policy" (initially simple, later replaced by ILP rules)
-            action = simple_policy(obs)
+            neg_lines.append(f"neg({lit}).")
 
-        state_id = f"s{env.t:06d}_{step_idx:04d}"
-        step_idx += 1
-
-        step = env.step(action)
-
-        # label only meaningful events
-        label = None
-        if step.event in (Event.CLEARED_GAP, Event.CLEARED_ENEMY):
-            label = "pos"
-        elif step.event in (Event.FELL_INTO_GAP, Event.HIT_ENEMY, Event.WASTED_ATTACK):
-            label = "neg"
-
-        if label:
-            examples.append(
-                Example(
-                    state_id=state_id,
-                    enemy_dist=dist_to_atom(
-                        step.info.get("enemy_dist_before")),
-                    gap_dist=dist_to_atom(step.info.get("gap_dist_before")),
-                    on_ground=bool(step.info.get("on_ground_before")),
-                    action=action.value,
-                    label=label,
-                )
-            )
-
-        obs = step.obs
-        if step.done:
-            return env.player_x, examples
+    exs_pl.write_text("\n".join(pos_lines + [""] + neg_lines) + "\n")
 
 
-def simple_policy(obs) -> Action:
-    """
-    Placeholder policy used when not exploring.
-    Keep it VERY simple; this is not the learner.
-    """
-    # Attack if enemy is exactly 1 away
-    if obs.enemy_dist == 1 and obs.on_ground:
-        return Action.ATTACK
-    # Jump if gap is exactly 1 away
-    if obs.gap_dist == 1 and obs.on_ground:
-        return Action.JUMP
-    return Action.DO_NOTHING
+def run_popper(task_dir: Path) -> int:
+    cmd = [sys.executable, "Popper/popper.py", str(task_dir)]
+    print("Running:", " ".join(cmd))
+    return subprocess.call(cmd)
 
 
-def write_popper_files(examples: List[Example], out_dir: str) -> None:
-    os.makedirs(out_dir, exist_ok=True)
+# -----------------------------
+# CLI
+# -----------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--episodes", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max_steps", type=int, default=500)
+    ap.add_argument("--out", type=str, default="ilp")
+    ap.add_argument("--run_popper", action="store_true")
+    args = ap.parse_args()
 
-    bk_path = os.path.join(out_dir, "bk.pl")
-    exs_path = os.path.join(out_dir, "exs.pl")
-    bias_path = os.path.join(out_dir, "bias.pl")
+    out_dir = Path(args.out)
 
-    # --- Background knowledge ---
-    # Keep it minimal for now: distances and boolean ground.
-    with open(bk_path, "w", encoding="utf-8") as f:
-        f.write("% Background knowledge\n")
-        f.write("dist(1). dist(2). dist(3). dist(far).\n")
-        f.write("near(1). near(2).\n")
-        f.write("far(far).\n\n")
+    exs, bk = collect_dataset(
+        episodes=args.episodes,
+        seed=args.seed,
+        max_steps_per_ep=args.max_steps,
+    )
 
-        # State facts
-        for ex in examples:
-            f.write(f"enemy_dist({ex.state_id},{ex.enemy_dist}).\n")
-            f.write(f"gap_dist({ex.state_id},{ex.gap_dist}).\n")
-            f.write(
-                f"on_ground({ex.state_id},{'true' if ex.on_ground else 'false'}).\n")
+    write_task(out_dir, exs, bk)
 
-    # --- Examples ---
-    with open(exs_path, "w", encoding="utf-8") as f:
-        for ex in examples:
-            if ex.label == "pos":
-                f.write(f"pos(good_action({ex.state_id},{ex.action})).\n")
-            else:
-                f.write(f"neg(good_action({ex.state_id},{ex.action})).\n")
-
-    # --- Bias (Popper) ---
-    # This is a conservative bias; we can tune later.
-    with open(bias_path, "w", encoding="utf-8") as f:
-        f.write("% Popper bias\n")
-        f.write("head_pred(good_action,2).\n")
-        f.write("body_pred(enemy_dist,2).\n")
-        f.write("body_pred(gap_dist,2).\n")
-        f.write("body_pred(on_ground,2).\n")
-        f.write("body_pred(near,1).\n")
-        f.write("body_pred(far,1).\n\n")
-
-        f.write("type(good_action,(state,action)).\n")
-        f.write("type(enemy_dist,(state,dist)).\n")
-        f.write("type(gap_dist,(state,dist)).\n")
-        f.write("type(on_ground,(state,bool)).\n")
-        f.write("type(near,(dist,)).\n")
-        f.write("type(far,(dist,)).\n\n")
-
-        f.write("direction(good_action,(in,in)).\n")
-        f.write("direction(enemy_dist,(in,out)).\n")
-        f.write("direction(gap_dist,(in,out)).\n")
-        f.write("direction(on_ground,(in,out)).\n")
-        f.write("direction(near,(in,)).\n")
-        f.write("direction(far,(in,)).\n\n")
-
-        # allow these constants as actions
-        f.write("action(do_nothing).\n")
-        f.write("action(jump).\n")
-        f.write("action(attack).\n\n")
-
-        f.write("max_body(4).\n")
-        f.write("max_vars(6).\n")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--episodes", type=int, default=200,
-                        help="Number of episodes to run")
-    parser.add_argument("--epsilon", type=float, default=0.5,
-                        help="Exploration probability")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", type=str, default="ilp",
-                        help="Output directory for Popper files")
-    parser.add_argument("--run-popper", action="store_true",
-                        help="Call Popper after generating files")
-    parser.add_argument("--popper-path", type=str,
-                        default="../Popper/popper.py", help="Path to popper.py")
-    args = parser.parse_args()
-
-    rng = random.Random(args.seed)
-    env = PlatformerEnv(seed=args.seed, length=300,
-                        lookahead=3, p_gap=0.08, p_enemy=0.08)
-
-    all_examples: List[Example] = []
-    distances: List[int] = []
-
-    for ep in range(args.episodes):
-        dist, exs = run_episode(env, policy_eps=args.epsilon, rng=rng)
-        distances.append(dist)
-        all_examples.extend(exs)
-
-    avg_dist = sum(distances) / max(1, len(distances))
-    print(f"Ran {args.episodes} episodes. Avg distance = {avg_dist:.1f}. Collected examples = {len(all_examples)}")
-
-    write_popper_files(all_examples, args.out)
-    print(f"Wrote Popper files to: {args.out}/ (bk.pl, exs.pl, bias.pl)")
+    print(f"Wrote task to: {out_dir}")
+    print(f"  bias.pl: {out_dir/'bias.pl'}")
+    print(f"  bk.pl:   {out_dir/'bk.pl'}")
+    print(f"  exs.pl:  {out_dir/'exs.pl'}")
 
     if args.run_popper:
-        # This assumes you cloned Popper somewhere; adjust popper path accordingly.
-        cmd = ["python3", args.popper_path, args.out]
-        print("Running Popper:", " ".join(cmd))
-        subprocess.run(cmd, check=False)
+        code = run_popper(out_dir)
+        raise SystemExit(code)
 
 
 if __name__ == "__main__":

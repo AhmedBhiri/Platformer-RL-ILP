@@ -9,26 +9,21 @@ from typing import Any, Dict, Optional
 
 class JsonlLogger:
     """
-    Writes one JSON record per line.
-    Safe for long runs, easy to parse, append-friendly.
+    Writes one JSON record per line (jsonl).
+    Append-friendly, easy to parse, robust for long runs.
     """
 
     def __init__(self, path: str, flush_every: int = 1) -> None:
         self.path = path
-        self.flush_every = max(1, flush_every)
-        self._n = 0
-
+        self.flush_every = max(1, int(flush_every))
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._f = open(path, "a", encoding="utf-8")
-        self._start_time = time.time()
+        self._n = 0
 
     def log(self, record: Dict[str, Any]) -> None:
-        # Add a timestamp and elapsed time for debugging / demo.
         record = dict(record)
-        record["ts"] = time.time()
-        record["elapsed_s"] = record["ts"] - self._start_time
-
-        self._f.write(json.dumps(record) + "\n")
+        record.setdefault("ts", time.time())
+        self._f.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._n += 1
         if self._n % self.flush_every == 0:
             self._f.flush()
