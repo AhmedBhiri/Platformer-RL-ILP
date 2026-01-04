@@ -6,10 +6,18 @@
 :- discontiguous enemy_dist/2.
 :- discontiguous gap_dist/2.
 :- discontiguous on_ground/2.
+:- discontiguous is_jump/1.
+:- discontiguous is_do_nothing/1.
+:- discontiguous is_attack/1.
 
 % distance buckets
 near(D) :- integer(D), D =< 1.
 far(D)  :- integer(D), D >= 2.
+
+% action identity facts
+is_jump(jump).
+is_do_nothing(do_nothing).
+is_attack(attack).
 
 enemy_dist(s000000000,99).
 gap_dist(s000000000,99).
