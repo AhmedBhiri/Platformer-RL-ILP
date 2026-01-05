@@ -25,36 +25,51 @@ def main():
     tiles_on_screen = WIDTH // tile_size + 2
 
     # --- Slowdown parameters ---
-    FPS = 15                # lower frame rate
-    STEP_EVERY_N_FRAMES = 2  # environment updates every N frames
+    FPS = 15
+    STEP_EVERY_N_FRAMES = 1
     frame_counter = 0
 
     font = pygame.font.SysFont(None, 22)
     running = True
-    action = Action.DO_NOTHING
+
+    # Jump is edge-triggered (press once = one jump)
+    jump_queued = False
 
     while running:
         clock.tick(FPS)
         frame_counter += 1
 
-        # --- Handle input ---
-        action = Action.DO_NOTHING
+        # --- Handle events (edge-trigger jump) ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    jump_queued = True  # queue exactly one jump
+
+        # --- Continuous keys (hold-trigger attack) ---
         keys = pygame.key.get_pressed()
-        if keys[pygame.K_ESCAPE]:
-            running = False
-        if keys[pygame.K_SPACE]:
+        attack_held = keys[pygame.K_a]
+
+        # Decide action for THIS step:
+        action = Action.DO_NOTHING
+        if jump_queued:
             action = Action.JUMP
-        elif keys[pygame.K_a]:
+        elif attack_held:
             action = Action.ATTACK
 
-        # --- Step env more slowly ---
+        # --- Step env ---
         if frame_counter % STEP_EVERY_N_FRAMES == 0:
             step = env.step(action)
             obs = step.obs
+
+            # consume the queued jump only when we actually step
+            if action == Action.JUMP:
+                jump_queued = False
+
             if step.done:
                 obs = env.reset()
 
@@ -100,7 +115,8 @@ def main():
             f"x={env.player_x}  t={env.t}",
             f"enemy_dist={obs.enemy_dist}  gap_dist={obs.gap_dist}  air_time={obs.air_time}",
             f"last_event={env.last_event.value}",
-            "Controls: SPACE=jump, A=attack, ESC=quit",
+            f"action_sent={action.value}  (hold A to attack, press SPACE to jump)",
+            "ESC=quit",
         ]
         for j, text in enumerate(hud_lines):
             img = font.render(text, True, (230, 230, 230))

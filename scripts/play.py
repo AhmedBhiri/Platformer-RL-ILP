@@ -3,14 +3,17 @@ import pygame
 import argparse
 
 from .logger import JsonlLogger, obs_to_dict
-
 from game.env import PlatformerEnv, Action, Tile
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log", type=str, default=None,
-                        help="Path to JSONL log file (e.g., data/run1.jsonl)")
+    parser.add_argument(
+        "--log",
+        type=str,
+        default=None,
+        help="Path to JSONL log file (e.g., data/run1.jsonl)",
+    )
     args = parser.parse_args()
 
     logger = JsonlLogger(args.log, flush_every=10) if args.log else None
@@ -32,37 +35,47 @@ def main():
     player_x_px = 200       # fixed on screen, world scrolls
     jump_height = 60        # pixels
 
-    # How many tiles to draw across screen
     tiles_on_screen = WIDTH // tile_size + 2
+    font = pygame.font.SysFont(None, 22)
 
-    # Control
-    action = Action.DO_NOTHING
     running = True
 
-    font = pygame.font.SysFont(None, 22)
+    # Jump edge-trigger: press SPACE -> exactly one jump
+    jump_queued = False
 
     try:
         while running:
             clock.tick(30)  # FPS
 
-            # --- Handle events ---
-            action = Action.DO_NOTHING
+            # --- Handle events (edge-trigger jump) ---
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        jump_queued = True
 
+            # --- Continuous keys (hold-trigger attack) ---
             keys = pygame.key.get_pressed()
-            if keys[pygame.K_ESCAPE]:
-                running = False
-            if keys[pygame.K_SPACE]:
+            attack_held = keys[pygame.K_a]
+
+            # Decide action for THIS step:
+            action = Action.DO_NOTHING
+            if jump_queued:
                 action = Action.JUMP
-            elif keys[pygame.K_a]:
+            elif attack_held:
                 action = Action.ATTACK
 
             # --- Step env ---
             state_before = obs  # save for logging
             step = env.step(action)
             obs = step.obs
+
+            # consume jump only after it was actually sent
+            if action == Action.JUMP:
+                jump_queued = False
 
             # --- Log ---
             if logger:
@@ -83,14 +96,10 @@ def main():
             # --- Draw ---
             screen.fill((20, 20, 20))
 
-            # Determine which tile index aligns with player screen position.
-            # Player is at env.player_x, and rendered at player_x_px.
-            # So tile at env.player_x is at screen position player_x_px.
             start_tile = env.player_x - (player_x_px // tile_size)
             if start_tile < 0:
                 start_tile = 0
 
-            # Draw tiles
             for i in range(tiles_on_screen):
                 tile_index = start_tile + i
                 x = i * tile_size
@@ -100,13 +109,11 @@ def main():
                 else:
                     tile = Tile.GROUND
 
-                # ground baseline rectangle
                 ground_rect = pygame.Rect(x, ground_y, tile_size, 60)
 
                 if tile == Tile.GROUND:
                     pygame.draw.rect(screen, (70, 50, 30), ground_rect)
                 elif tile == Tile.GAP:
-                    # draw nothing for gap (leave background), maybe border
                     pygame.draw.rect(screen, (40, 40, 40), ground_rect, 1)
                 elif tile == Tile.ENEMY:
                     pygame.draw.rect(screen, (70, 50, 30), ground_rect)
@@ -114,12 +121,10 @@ def main():
                         x + 6, ground_y - 26, tile_size - 12, 26)
                     pygame.draw.rect(screen, (200, 50, 50), enemy_rect)
 
-            # Draw player
-            player_on_ground = obs.on_ground
+            # Player
             y = ground_y - 30
-            if not player_on_ground:
-                # simple jump animation: lift while in air
-                y = (ground_y - 30) - jump_height
+            if not obs.on_ground:
+                y -= jump_height
 
             player_rect = pygame.Rect(player_x_px + 6, y, tile_size - 12, 30)
             pygame.draw.rect(screen, (70, 130, 255), player_rect)
@@ -129,7 +134,7 @@ def main():
                 f"x={env.player_x}  t={env.t}",
                 f"enemy_dist={obs.enemy_dist}  gap_dist={obs.gap_dist}  air_time={obs.air_time}",
                 f"last_event={env.last_event.value}",
-                "Controls: SPACE=jump, A=attack, ESC=quit",
+                "Controls: SPACE=jump (press), A=attack (hold), ESC=quit",
                 f"Logging: {'ON -> ' + args.log if logger else 'OFF'}",
             ]
             for j, text in enumerate(hud_lines):

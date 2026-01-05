@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import random
 
 
@@ -109,17 +109,36 @@ class PlatformerEnv:
         reward = 0.0
         event = Event.NONE
 
+        # -------------------------------------------------
+        # (0) Tick down airtime at START of step
+        #     (so a new jump gets full duration)
+        # -------------------------------------------------
+        if self.air_time > 0:
+            self.air_time -= 1
+
         # --- 1) Read current hazards in lookahead window ---
         enemy_dist = self._distance_to_next(Tile.ENEMY)
         gap_dist = self._distance_to_next(Tile.GAP)
 
         on_ground_before = (self.air_time == 0)
+        # --- shaping: discourage staying on ground when a gap is imminent ---
+        # If a gap is very close and you're on the ground, not jumping now is usually bad.
+
+        # This makes "jump" become the best immediate-reward action in those states,
+        # so Popper can learn pit rules.
+        if gap_dist is not None and gap_dist <= 2 and on_ground_before and action != Action.JUMP:
+            reward -= 2.0
+
+        # discourage not attacking when an enemy is imminent (and you're on the ground)
+        if enemy_dist is not None and enemy_dist <= 1 and on_ground_before and action != Action.ATTACK:
+            reward -= 1.0
 
         # --- 2) Apply action effects (before scrolling) ---
         if action == Action.JUMP:
             # only jump if on ground
             if on_ground_before:
                 self.air_time = self.jump_air_time
+
         elif action == Action.ATTACK:
             # only works if enemy is exactly 1 tile ahead NOW
             if enemy_dist == 1:
@@ -130,16 +149,13 @@ class PlatformerEnv:
             else:
                 event = Event.WASTED_ATTACK
                 reward -= 0.5
+
         elif action == Action.DO_NOTHING:
             pass
 
         # --- 3) Advance world by one step (player moves forward) ---
         self.player_x += 1
         self.t += 1
-
-        # update air_time after moving
-        if self.air_time > 0:
-            self.air_time -= 1
 
         on_ground_after = (self.air_time == 0)
 
@@ -164,10 +180,12 @@ class PlatformerEnv:
             self.done = True
             event = Event.HIT_ENEMY
             reward -= 10.0
+
         elif on_ground_after and tile_now == Tile.GAP:
             self.done = True
             event = Event.FELL_INTO_GAP
             reward -= 10.0
+
         else:
             # Survived this step.
             reward += 1.0
@@ -197,6 +215,7 @@ class PlatformerEnv:
                 "gap_dist_before": gap_dist,
                 "on_ground_before": on_ground_before,
                 "on_ground_after": on_ground_after,
+                "air_time": self.air_time,
             },
         )
 
@@ -242,8 +261,8 @@ class PlatformerEnv:
 
     def _make_obs(self) -> Obs:
         return Obs(
-            enemy_dist=self._distance_to_next(Tile.ENEMY),
             gap_dist=self._distance_to_next(Tile.GAP),
+            enemy_dist=self._distance_to_next(Tile.ENEMY),
             on_ground=(self.air_time == 0),
             air_time=self.air_time,
         )

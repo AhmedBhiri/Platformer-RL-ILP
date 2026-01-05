@@ -83,9 +83,10 @@ def collect_dataset(
       exs: list of (state_id, action_atom, is_positive)
       bk:  dict state_id -> features dict
 
-    If label_best_action=True (recommended):
+    If label_best_action=True:
       - for each state, simulate all actions (via deepcopy(env))
-      - pos = best reward action(s); neg = others
+      - pos = SINGLE best reward action per state (ties broken by ACTIONS order)
+      - neg = all other actions
     Else:
       - take one random action and label by reward>0 (noisier)
     """
@@ -133,11 +134,18 @@ def collect_dataset(
                         break
 
                 if sim_ok and rewards:
-                    best = max(rewards.values())
-                    # You can require best>0 if you want fewer positives. For now: best action(s) always positive.
+                    # pick ONE best action (ties broken deterministically by ACTIONS order)
+                    best_action = ACTIONS[0]
+                    best_reward = rewards.get(best_action, float("-inf"))
+                    for a in ACTIONS[1:]:
+                        r = rewards[a]
+                        if r > best_reward:
+                            best_reward = r
+                            best_action = a
+
                     for a in ACTIONS:
                         act_atom = action_to_atom(a)
-                        is_pos = rewards[a] == best
+                        is_pos = (a == best_action)
                         key = (state_id, act_atom)
                         if key in seen_label:
                             continue
@@ -171,7 +179,6 @@ def collect_dataset(
                     break
 
             # advance the real env by taking a real action (so we keep moving)
-            # If label_best_action=True we still need to actually step env once to progress.
             if label_best_action:
                 a_real = rng.choice(ACTIONS)
                 step_real = env.step(a_real)
@@ -189,26 +196,47 @@ DEFAULT_BIAS = "\n".join(
     [
         "% Popper bias",
         "head_pred(good_action,2).",
+        "",
+        "% state feature predicates",
         "body_pred(enemy_dist,2).",
         "body_pred(gap_dist,2).",
         "body_pred(on_ground,2).",
         "body_pred(near,1).",
         "body_pred(far,1).",
+        "body_pred(pit_near,1).",
+        "body_pred(enemy_near,1).",
         "",
+        "% action identity predicates (so Popper can talk about A)",
+        "body_pred(is_jump,1).",
+        "body_pred(is_do_nothing,1).",
+        "body_pred(is_attack,1).",
+        "",
+        "% IMPORTANT: Popper expects 1-tuples with a trailing comma",
         "type(good_action,(state,action)).",
         "type(enemy_dist,(state,dist)).",
         "type(gap_dist,(state,dist)).",
         "type(on_ground,(state,bool)).",
-        "type(near,(dist)).",
-        "type(far,(dist)).",
+        "type(near,(dist,)).",
+        "type(far,(dist,)).",
+        "type(pit_near,(state,)).",
+        "type(enemy_near,(state,)).",
+        "type(is_jump,(action,)).",
+        "type(is_do_nothing,(action,)).",
+        "type(is_attack,(action,)).",
         "",
         "direction(good_action,(in,in)).",
         "direction(enemy_dist,(in,out)).",
         "direction(gap_dist,(in,out)).",
         "direction(on_ground,(in,out)).",
-        "direction(near,(in)).",
-        "direction(far,(in)).",
+        "direction(near,(in,)).",
+        "direction(far,(in,)).",
+        "direction(pit_near,(in,)).",
+        "direction(enemy_near,(in,)).",
+        "direction(is_jump,(in,)).",
+        "direction(is_do_nothing,(in,)).",
+        "direction(is_attack,(in,)).",
         "",
+        "% declare allowed action constants",
         "action(do_nothing).",
         "action(jump).",
         "action(attack).",
@@ -260,10 +288,16 @@ def write_task(
         ":- discontiguous is_jump/1.",
         ":- discontiguous is_do_nothing/1.",
         ":- discontiguous is_attack/1.",
+        ":- discontiguous pit_near/1.",
+        ":- discontiguous enemy_near/1.",
         "",
         "% distance buckets",
-        "near(D) :- integer(D), D =< 1.",
-        "far(D)  :- integer(D), D >= 2.",
+        "near(D) :- integer(D), D =< 3.",
+        "far(D)  :- integer(D), D >= 6.",
+        "",
+        "% convenience booleans",
+        "pit_near(S) :- gap_dist(S,D), near(D).",
+        "enemy_near(S) :- enemy_dist(S,D), near(D).",
         "",
         "% action identity facts",
         "is_jump(jump).",
@@ -271,11 +305,23 @@ def write_task(
         "is_attack(attack).",
         "",
     ]
+
+    # IMPORTANT FIX:
+    # Do NOT emit enemy_dist/gap_dist facts when nothing is in view.
+    # Previously you wrote enemy_dist(S,99). gap_dist(S,99). for "none",
+    # which makes enemy_dist/2 and gap_dist/2 true for ALL states.
     for sid, feats in bk.items():
-        lines.append(f"enemy_dist({sid},{feats['enemy_dist']}).")
-        lines.append(f"gap_dist({sid},{feats['gap_dist']}).")
+        ed = feats["enemy_dist"]
+        gd = feats["gap_dist"]
+
+        if ed != 99:
+            lines.append(f"enemy_dist({sid},{ed}).")
+        if gd != 99:
+            lines.append(f"gap_dist({sid},{gd}).")
+
         lines.append(
             f"on_ground({sid},{'true' if feats['on_ground'] else 'false'}).")
+
     bk_pl.write_text("\n".join(lines) + "\n")
 
     # exs.pl
@@ -369,7 +415,7 @@ def main() -> None:
     print(f"  exs.pl:  {out_dir/'exs.pl'}")
 
     if args.run_popper:
-        popper_args = []
+        popper_args: List[str] = []
         if args.noisy:
             popper_args.append("--noisy")
         popper_args += unknown
