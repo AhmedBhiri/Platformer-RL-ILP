@@ -11,6 +11,7 @@
 :- discontiguous is_attack/1.
 :- discontiguous pit_near/1.
 :- discontiguous enemy_near/1.
+:- discontiguous enemy_attackable/1.
 
 % distance buckets
 near(D) :- integer(D), D =< 3.
@@ -19,6 +20,7 @@ far(D)  :- integer(D), D >= 6.
 % convenience booleans
 pit_near(S) :- gap_dist(S,D), near(D).
 enemy_near(S) :- enemy_dist(S,D), near(D).
+enemy_attackable(S) :- enemy_dist(S,1).
 
 % action identity facts
 is_jump(jump).

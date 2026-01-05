@@ -9,6 +9,7 @@ body_pred(near,1).
 body_pred(far,1).
 body_pred(pit_near,1).
 body_pred(enemy_near,1).
+body_pred(enemy_attackable,1).
 
 % action identity predicates (so Popper can talk about A)
 body_pred(is_jump,1).
@@ -27,6 +28,7 @@ type(enemy_near,(state,)).
 type(is_jump,(action,)).
 type(is_do_nothing,(action,)).
 type(is_attack,(action,)).
+type(enemy_attackable,(state,)).
 
 direction(good_action,(in,in)).
 direction(enemy_dist,(in,out)).
@@ -39,6 +41,7 @@ direction(enemy_near,(in,)).
 direction(is_jump,(in,)).
 direction(is_do_nothing,(in,)).
 direction(is_attack,(in,)).
+direction(enemy_attackable,(in,)).
 
 % declare allowed action constants
 action(do_nothing).

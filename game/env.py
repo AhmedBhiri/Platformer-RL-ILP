@@ -130,8 +130,8 @@ class PlatformerEnv:
             reward -= 2.0
 
         # discourage not attacking when an enemy is imminent (and you're on the ground)
-        if enemy_dist is not None and enemy_dist <= 1 and on_ground_before and action != Action.ATTACK:
-            reward -= 1.0
+        if enemy_dist is not None and enemy_dist <= 1 and action != Action.ATTACK:
+            reward -= 3.0
 
         # --- 2) Apply action effects (before scrolling) ---
         if action == Action.JUMP:

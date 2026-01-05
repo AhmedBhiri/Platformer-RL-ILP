@@ -205,6 +205,7 @@ DEFAULT_BIAS = "\n".join(
         "body_pred(far,1).",
         "body_pred(pit_near,1).",
         "body_pred(enemy_near,1).",
+        "body_pred(enemy_attackable,1).",
         "",
         "% action identity predicates (so Popper can talk about A)",
         "body_pred(is_jump,1).",
@@ -223,6 +224,7 @@ DEFAULT_BIAS = "\n".join(
         "type(is_jump,(action,)).",
         "type(is_do_nothing,(action,)).",
         "type(is_attack,(action,)).",
+        "type(enemy_attackable,(state,)).",
         "",
         "direction(good_action,(in,in)).",
         "direction(enemy_dist,(in,out)).",
@@ -235,6 +237,7 @@ DEFAULT_BIAS = "\n".join(
         "direction(is_jump,(in,)).",
         "direction(is_do_nothing,(in,)).",
         "direction(is_attack,(in,)).",
+        "direction(enemy_attackable,(in,)).",
         "",
         "% declare allowed action constants",
         "action(do_nothing).",
@@ -290,6 +293,7 @@ def write_task(
         ":- discontiguous is_attack/1.",
         ":- discontiguous pit_near/1.",
         ":- discontiguous enemy_near/1.",
+        ":- discontiguous enemy_attackable/1.",
         "",
         "% distance buckets",
         "near(D) :- integer(D), D =< 3.",
@@ -298,12 +302,14 @@ def write_task(
         "% convenience booleans",
         "pit_near(S) :- gap_dist(S,D), near(D).",
         "enemy_near(S) :- enemy_dist(S,D), near(D).",
+        "enemy_attackable(S) :- enemy_dist(S,1).",
         "",
         "% action identity facts",
         "is_jump(jump).",
         "is_do_nothing(do_nothing).",
         "is_attack(attack).",
         "",
+
     ]
 
     # IMPORTANT FIX:
