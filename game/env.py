@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import random
 
 
@@ -16,6 +16,12 @@ class Action(str, Enum):
     DO_NOTHING = "do_nothing"
     JUMP = "jump"
     ATTACK = "attack"
+    DUCK = "duck"
+
+
+class ProjectileHeight(str, Enum):
+    LOW = "low"
+    HIGH = "high"
 
 
 class Event(str, Enum):
@@ -25,21 +31,22 @@ class Event(str, Enum):
     HIT_ENEMY = "hit_enemy"
     FELL_INTO_GAP = "fell_into_gap"
     WASTED_ATTACK = "wasted_attack"
-    CLEARED_PROJECTILE = "cleared_projectile"
     HIT_PROJECTILE = "hit_projectile"
+    DODGED_PROJECTILE = "dodged_projectile"
 
 
 @dataclass(frozen=True)
 class Obs:
     """
-    Observation is symbolic-friendly: discrete distances + player stance.
-    Distances are ints in {1,2,3} or None meaning 'far / not in window'.
+    Distances are ints in {1..lookahead} or None meaning 'not in window'.
     """
-    enemy_dist: Optional[int]        # 1..lookahead or None
-    gap_dist: Optional[int]          # 1..lookahead or None
-    projectile_dist: Optional[int]   # 1..lookahead or None
+    enemy_dist: Optional[int]
+    gap_dist: Optional[int]
+    projectile_dist: Optional[int]
+    projectile_low: bool
+    projectile_high: bool
     on_ground: bool
-    air_time: int                    # remaining steps in air (0 => on ground)
+    air_time: int
 
 
 @dataclass
@@ -53,14 +60,22 @@ class StepResult:
 
 class PlatformerEnv:
     """
-    A tiny 1D platformer environment (no graphics).
-    - World is a list of tiles that scrolls as the player moves forward.
-    - Player can jump, attack, or do nothing.
-    - Enemies can fire projectiles that travel toward the player.
-    - ATTACK can clear:
-        * enemy at distance 1
-        * projectile at distance 1
-    - If a gap, enemy, or projectile reaches the player's tile while on ground => terminal.
+    1D platformer + projectiles.
+
+    Projectile rules:
+      - LOW projectile: must JUMP (be in air) to dodge
+      - HIGH projectile: must DUCK to dodge
+
+    Enemy rules:
+      - ATTACK clears enemy at dist=1 (before scrolling)
+      - enemy on your tile while on ground => death
+
+    Gap rules:
+      - gap on your tile while on ground => death
+      - jumping lets you clear gaps
+
+    DUCK:
+      - one-step stance (ducking_this_step)
     """
 
     def __init__(
@@ -70,30 +85,31 @@ class PlatformerEnv:
         jump_air_time: int = 2,
         p_gap: float = 0.08,
         p_enemy: float = 0.08,
-        p_shoot: float = 0.15,  # chance an enemy shoots when in view
+        p_shoot: float = 0.15,     # enemy shoots chance when visible
+        p_low_proj: float = 0.5,   # LOW vs HIGH projectile mix
         seed: Optional[int] = None,
     ) -> None:
         if lookahead < 1:
             raise ValueError("lookahead must be >= 1")
+
         self.length = length
         self.lookahead = lookahead
         self.jump_air_time = jump_air_time
         self.p_gap = p_gap
         self.p_enemy = p_enemy
         self.p_shoot = p_shoot
+        self.p_low_proj = p_low_proj
         self.rng = random.Random(seed)
 
-        # internal state
         self.track: List[Tile] = []
-        self.t: int = 0                 # timestep
-        self.player_x: int = 0          # index in track
-        self.air_time: int = 0          # remaining air steps
+        self.t: int = 0
+        self.player_x: int = 0
+        self.air_time: int = 0
         self.done: bool = False
 
-        # enemy projectiles (absolute x positions in track coordinates)
-        self.projectiles: List[int] = []
+        # projectiles: list of (x, height)
+        self.projectiles: List[Tuple[int, ProjectileHeight]] = []
 
-        # for optional logging / analysis
         self.last_event: Event = Event.NONE
 
     def reset(self) -> Obs:
@@ -112,7 +128,6 @@ class PlatformerEnv:
                 "Episode is done. Call reset() to start a new episode.")
 
         if not isinstance(action, Action):
-            # allow passing strings
             try:
                 action = Action(action)
             except Exception as e:
@@ -121,85 +136,75 @@ class PlatformerEnv:
         reward = 0.0
         event = Event.NONE
 
-        # -------------------------------------------------
-        # (0) Tick down airtime at START of step
-        #     (so a new jump gets full duration)
-        # -------------------------------------------------
+        ducking_this_step = (action == Action.DUCK)
+
+        # (0) Tick down airtime at START (so new jump gets full duration)
         if self.air_time > 0:
             self.air_time -= 1
 
-        # --- 1) Read current hazards in lookahead window ---
+        # (1) Read hazards
         enemy_dist = self._distance_to_next(Tile.ENEMY)
         gap_dist = self._distance_to_next(Tile.GAP)
-        projectile_dist = self._distance_to_next_projectile()
+        proj_dist, proj_h = self._nearest_projectile_in_view()
 
         on_ground_before = (self.air_time == 0)
 
-        # --- (1.5) Enemies may shoot (spawn projectile at enemy position) ---
-        # Keep it simple: if an enemy is visible, it may shoot a projectile.
+        # (1.5) Enemies may shoot (spawn projectile at enemy position)
         if enemy_dist is not None:
             enemy_x = self.player_x + enemy_dist
             if self.rng.random() < self.p_shoot:
-                # avoid spawning duplicates at same position
-                if enemy_x not in self.projectiles:
-                    self.projectiles.append(enemy_x)
+                h = ProjectileHeight.LOW if self.rng.random(
+                ) < self.p_low_proj else ProjectileHeight.HIGH
+                if (enemy_x, h) not in self.projectiles:
+                    self.projectiles.append((enemy_x, h))
 
-        # --- shaping: discourage staying on ground when a gap is imminent ---
+        # (1.6) Reward shaping (keep yours, add projectile-specific preference)
         if gap_dist is not None and gap_dist <= 2 and on_ground_before and action != Action.JUMP:
             reward -= 2.0
-
-        # discourage not attacking when an enemy is imminent
         if enemy_dist is not None and enemy_dist <= 1 and action != Action.ATTACK:
             reward -= 3.0
 
-        # discourage not attacking when a projectile is imminent
-        if projectile_dist is not None and projectile_dist <= 1 and action != Action.ATTACK:
-            reward -= 2.0
+        # Projectile shaping: prefer the correct response depending on height
+        if proj_dist is not None and proj_dist <= 1:
+            if proj_h == ProjectileHeight.LOW:
+                if action == Action.JUMP:
+                    reward += 1.0
+                elif action != Action.JUMP:
+                    reward -= 1.5
+            elif proj_h == ProjectileHeight.HIGH:
+                if action == Action.DUCK:
+                    reward += 1.0
+                elif action != Action.DUCK:
+                    reward -= 1.5
 
-        # --- 2) Apply action effects (before scrolling) ---
+        # (2) Apply action effects (before scrolling)
         if action == Action.JUMP:
-            # only jump if on ground
             if on_ground_before:
                 self.air_time = self.jump_air_time
 
         elif action == Action.ATTACK:
-            cleared_something = False
-
-            # clear enemy if exactly 1 tile ahead NOW
             if enemy_dist == 1 and (self.player_x + 1) < len(self.track):
                 self.track[self.player_x + 1] = Tile.GROUND
-                reward += 3.0
                 event = Event.CLEARED_ENEMY
-                cleared_something = True
-
-            # also clear projectile if exactly 1 tile ahead NOW
-            if (self.player_x + 1) in self.projectiles:
-                self.projectiles = [
-                    p for p in self.projectiles if p != (self.player_x + 1)]
-                reward += 2.0
-                # if we didn't already set event to cleared_enemy, use cleared_projectile
-                if event == Event.NONE:
-                    event = Event.CLEARED_PROJECTILE
-                cleared_something = True
-
-            if not cleared_something:
+                reward += 3.0
+            else:
                 event = Event.WASTED_ATTACK
                 reward -= 0.5
 
-        elif action == Action.DO_NOTHING:
-            pass
+        elif action == Action.DUCK:
+            reward -= 0.05  # tiny cost to stop random duck spam
 
-        # --- 3) Advance world by one step (player moves forward) ---
+        # (3) Advance world
         self.player_x += 1
         self.t += 1
 
-        # projectiles travel toward the player by 1 each step
-        # (absolute positions shift left in world coordinates relative to the player)
-        self.projectiles = [p - 1 for p in self.projectiles]
+        # move projectiles toward player by 1 each step
+        self.projectiles = [(px - 1, h) for (px, h) in self.projectiles]
 
         on_ground_after = (self.air_time == 0)
+        in_air = not on_ground_after
 
-        # --- 4) Check end of track ---
+        # (4) End of track
         if self.player_x >= len(self.track):
             self.done = True
             reward += 5.0
@@ -212,46 +217,52 @@ class PlatformerEnv:
                       "reason": "end_of_track"},
             )
 
-        # --- 5) Check what is on the player's tile now ---
         tile_now = self.track[self.player_x]
 
-        # Projectile collision (terminal only if on ground, like other hazards)
-        if on_ground_after and self.player_x in self.projectiles:
-            self.done = True
-            event = Event.HIT_PROJECTILE
-            reward -= 10.0
+        # (5) Projectile collision first (can be dodged)
+        hit_h = None
+        for (px, h) in self.projectiles:
+            if px == self.player_x:
+                hit_h = h
+                break
 
-        # Terminal collisions only if on ground.
-        elif on_ground_after and tile_now == Tile.ENEMY:
-            self.done = True
-            event = Event.HIT_ENEMY
-            reward -= 10.0
+        if hit_h is not None:
+            ok = False
+            if hit_h == ProjectileHeight.LOW:
+                ok = in_air
+            elif hit_h == ProjectileHeight.HIGH:
+                ok = ducking_this_step
 
-        elif on_ground_after and tile_now == Tile.GAP:
-            self.done = True
-            event = Event.FELL_INTO_GAP
-            reward -= 10.0
+            if ok:
+                self.projectiles = [(px, h) for (
+                    px, h) in self.projectiles if px != self.player_x]
+                if event == Event.NONE:
+                    event = Event.DODGED_PROJECTILE
+                reward += 1.0
+            else:
+                self.done = True
+                event = Event.HIT_PROJECTILE
+                reward -= 10.0
 
-        else:
-            # Survived this step.
-            reward += 1.0
-
-            # Optional shaping: reward clearing hazards by being in air when crossing them.
-            # (Only if not already set to cleared_enemy/wasted_attack/cleared_projectile)
-            if event == Event.NONE:
-                if tile_now == Tile.ENEMY and not on_ground_after:
-                    event = Event.CLEARED_ENEMY
-                    reward += 2.0
-                elif tile_now == Tile.GAP and not on_ground_after:
-                    event = Event.CLEARED_GAP
-                    reward += 2.0
-                # if projectile reaches your tile while you're in air, treat as "cleared"
-                elif self.player_x in self.projectiles and not on_ground_after:
-                    # remove it (you "dodged" it)
-                    self.projectiles = [
-                        p for p in self.projectiles if p != self.player_x]
-                    event = Event.CLEARED_PROJECTILE
-                    reward += 1.0
+        # (6) Normal hazards
+        if not self.done:
+            if on_ground_after and tile_now == Tile.ENEMY:
+                self.done = True
+                event = Event.HIT_ENEMY
+                reward -= 10.0
+            elif on_ground_after and tile_now == Tile.GAP:
+                self.done = True
+                event = Event.FELL_INTO_GAP
+                reward -= 10.0
+            else:
+                reward += 1.0
+                if event == Event.NONE:
+                    if tile_now == Tile.ENEMY and in_air:
+                        event = Event.CLEARED_ENEMY
+                        reward += 2.0
+                    elif tile_now == Tile.GAP and in_air:
+                        event = Event.CLEARED_GAP
+                        reward += 2.0
 
         self.last_event = event
 
@@ -266,7 +277,9 @@ class PlatformerEnv:
                 "action": action.value,
                 "enemy_dist_before": enemy_dist,
                 "gap_dist_before": gap_dist,
-                "projectile_dist_before": projectile_dist,
+                "projectile_dist_before": proj_dist,
+                "projectile_height_before": (proj_h.value if proj_h else None),
+                "ducking": ducking_this_step,
                 "on_ground_before": on_ground_before,
                 "on_ground_after": on_ground_after,
                 "air_time": self.air_time,
@@ -277,14 +290,7 @@ class PlatformerEnv:
     # ---------- Helpers ----------
 
     def _generate_track(self, length: int) -> List[Tile]:
-        """
-        Generate a simple track:
-        - Mostly ground.
-        - Random single-tile gaps and enemies, spaced to avoid impossible situations.
-        """
         track: List[Tile] = [Tile.GROUND] * length
-
-        # Keep the first few tiles safe
         safe_prefix = max(5, self.lookahead + 2)
 
         i = safe_prefix
@@ -292,46 +298,39 @@ class PlatformerEnv:
             r = self.rng.random()
             if r < self.p_gap:
                 track[i] = Tile.GAP
-                i += 2  # spacing
+                i += 2
             elif r < self.p_gap + self.p_enemy:
                 track[i] = Tile.ENEMY
                 i += 2
             else:
                 i += 1
 
-        # Ensure start tile is safe
         track[0] = Tile.GROUND
         return track
 
     def _distance_to_next(self, tile_type: Tile) -> Optional[int]:
-        """
-        Distance from player to next tile of a given type within lookahead.
-        Returns 1..lookahead, or None if not found.
-        """
         for d in range(1, self.lookahead + 1):
             idx = self.player_x + d
             if idx < len(self.track) and self.track[idx] == tile_type:
                 return d
         return None
 
-    def _distance_to_next_projectile(self) -> Optional[int]:
-        """
-        Distance from player to next projectile within lookahead.
-        Returns 1..lookahead, or None if not found.
-        """
-        if not self.projectiles:
-            return None
-        # projectiles are absolute positions; find nearest ahead
+    def _nearest_projectile_in_view(self) -> Tuple[Optional[int], Optional[ProjectileHeight]]:
         for d in range(1, self.lookahead + 1):
-            if (self.player_x + d) in self.projectiles:
-                return d
-        return None
+            x = self.player_x + d
+            for (px, h) in self.projectiles:
+                if px == x:
+                    return d, h
+        return None, None
 
     def _make_obs(self) -> Obs:
+        proj_d, proj_h = self._nearest_projectile_in_view()
         return Obs(
             gap_dist=self._distance_to_next(Tile.GAP),
             enemy_dist=self._distance_to_next(Tile.ENEMY),
-            projectile_dist=self._distance_to_next_projectile(),
+            projectile_dist=proj_d,
+            projectile_low=(proj_h == ProjectileHeight.LOW),
+            projectile_high=(proj_h == ProjectileHeight.HIGH),
             on_ground=(self.air_time == 0),
             air_time=self.air_time,
         )

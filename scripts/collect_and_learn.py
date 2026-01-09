@@ -33,8 +33,6 @@ def dist_value(x: Any) -> int:
     """
     Normalize distances to integers for BK facts.
     - int -> int
-    - 'far' -> 99
-    - 'near' -> 1
     - None/unknown -> 99
     """
     if x is None:
@@ -63,10 +61,13 @@ def action_to_atom(a: Action) -> str:
         return "jump"
     if a == Action.ATTACK:
         return "attack"
+    if a == Action.DUCK:
+        return "duck"
     return str(a).lower().replace(".", "_")
 
 
-ACTIONS: List[Action] = [Action.DO_NOTHING, Action.JUMP, Action.ATTACK]
+ACTIONS: List[Action] = [Action.DO_NOTHING,
+                         Action.JUMP, Action.ATTACK, Action.DUCK]
 
 
 # -----------------------------
@@ -92,7 +93,7 @@ def collect_dataset(
     """
     rng = random.Random(seed)
     env = PlatformerEnv(seed=seed, length=300, lookahead=10,
-                        p_gap=0.08, p_enemy=0.08)
+                        p_gap=0.08, p_enemy=0.08, p_shoot=0.15)
 
     global_state_counter = 0
 
@@ -112,16 +113,23 @@ def collect_dataset(
             od = obs_to_dict(obs)
             enemy_d = dist_value(od.get("enemy_dist"))
             gap_d = dist_value(od.get("gap_dist"))
+            proj_d = dist_value(od.get("projectile_dist"))
             on_ground = bool(od.get("on_ground", False))
+
+            # projectile type booleans from Obs
+            proj_low = bool(od.get("projectile_low", False))
+            proj_high = bool(od.get("projectile_high", False))
 
             bk[state_id] = {
                 "enemy_dist": enemy_d,
                 "gap_dist": gap_d,
+                "projectile_dist": proj_d,
+                "projectile_low": proj_low,
+                "projectile_high": proj_high,
                 "on_ground": on_ground,
             }
 
             if label_best_action:
-                # Try to simulate all actions from the same state
                 rewards: Dict[Action, float] = {}
                 sim_ok = True
                 for a in ACTIONS:
@@ -134,7 +142,6 @@ def collect_dataset(
                         break
 
                 if sim_ok and rewards:
-                    # pick ONE best action (ties broken deterministically by ACTIONS order)
                     best_action = ACTIONS[0]
                     best_reward = rewards.get(best_action, float("-inf"))
                     for a in ACTIONS[1:]:
@@ -152,7 +159,6 @@ def collect_dataset(
                         seen_label[key] = is_pos
                         exs.append((state_id, act_atom, is_pos))
                 else:
-                    # Fallback: one random action, label by reward>0
                     a = rng.choice(ACTIONS)
                     step = env.step(a)
                     obs = step.obs
@@ -165,7 +171,6 @@ def collect_dataset(
                     if step.done:
                         break
             else:
-                # Noisy mode: one random action per state
                 a = rng.choice(ACTIONS)
                 step = env.step(a)
                 obs = step.obs
@@ -178,7 +183,6 @@ def collect_dataset(
                 if step.done:
                     break
 
-            # advance the real env by taking a real action (so we keep moving)
             if label_best_action:
                 a_real = rng.choice(ACTIONS)
                 step_real = env.step(a_real)
@@ -200,49 +204,74 @@ DEFAULT_BIAS = "\n".join(
         "% state feature predicates",
         "body_pred(enemy_dist,2).",
         "body_pred(gap_dist,2).",
+        "body_pred(projectile_dist,2).",
         "body_pred(on_ground,2).",
         "body_pred(near,1).",
         "body_pred(far,1).",
         "body_pred(pit_near,1).",
         "body_pred(enemy_near,1).",
         "body_pred(enemy_attackable,1).",
+        "body_pred(proj_near,1).",
+        "body_pred(proj_attackable,1).",
+        "body_pred(proj_low,1).",
+        "body_pred(proj_high,1).",
+        "body_pred(proj_low_near,1).",
+        "body_pred(proj_high_near,1).",
         "",
-        "% action identity predicates (so Popper can talk about A)",
+        "% action identity predicates",
         "body_pred(is_jump,1).",
         "body_pred(is_do_nothing,1).",
         "body_pred(is_attack,1).",
+        "body_pred(is_duck,1).",
         "",
         "% IMPORTANT: Popper expects 1-tuples with a trailing comma",
         "type(good_action,(state,action)).",
         "type(enemy_dist,(state,dist)).",
         "type(gap_dist,(state,dist)).",
+        "type(projectile_dist,(state,dist)).",
         "type(on_ground,(state,bool)).",
         "type(near,(dist,)).",
         "type(far,(dist,)).",
         "type(pit_near,(state,)).",
         "type(enemy_near,(state,)).",
+        "type(enemy_attackable,(state,)).",
+        "type(proj_near,(state,)).",
+        "type(proj_attackable,(state,)).",
+        "type(proj_low,(state,)).",
+        "type(proj_high,(state,)).",
+        "type(proj_low_near,(state,)).",
+        "type(proj_high_near,(state,)).",
         "type(is_jump,(action,)).",
         "type(is_do_nothing,(action,)).",
         "type(is_attack,(action,)).",
-        "type(enemy_attackable,(state,)).",
+        "type(is_duck,(action,)).",
         "",
         "direction(good_action,(in,in)).",
         "direction(enemy_dist,(in,out)).",
         "direction(gap_dist,(in,out)).",
+        "direction(projectile_dist,(in,out)).",
         "direction(on_ground,(in,out)).",
         "direction(near,(in,)).",
         "direction(far,(in,)).",
         "direction(pit_near,(in,)).",
         "direction(enemy_near,(in,)).",
+        "direction(enemy_attackable,(in,)).",
+        "direction(proj_near,(in,)).",
+        "direction(proj_attackable,(in,)).",
+        "direction(proj_low,(in,)).",
+        "direction(proj_high,(in,)).",
+        "direction(proj_low_near,(in,)).",
+        "direction(proj_high_near,(in,)).",
         "direction(is_jump,(in,)).",
         "direction(is_do_nothing,(in,)).",
         "direction(is_attack,(in,)).",
-        "direction(enemy_attackable,(in,)).",
+        "direction(is_duck,(in,)).",
         "",
         "% declare allowed action constants",
         "action(do_nothing).",
         "action(jump).",
         "action(attack).",
+        "action(duck).",
         "",
         "max_body(4).",
         "max_vars(6).",
@@ -263,7 +292,6 @@ def write_task(
     # bias.pl
     bias_pl = out_dir / "bias.pl"
     if bias_path is not None:
-        # copy external bias into task dir
         text = Path(bias_path).read_text()
         if overwrite_bias or not bias_pl.exists():
             bias_pl.write_text(text)
@@ -287,13 +315,21 @@ def write_task(
         "",
         ":- discontiguous enemy_dist/2.",
         ":- discontiguous gap_dist/2.",
+        ":- discontiguous projectile_dist/2.",
         ":- discontiguous on_ground/2.",
+        ":- discontiguous proj_low/1.",
+        ":- discontiguous proj_high/1.",
+        ":- discontiguous proj_low_near/1.",
+        ":- discontiguous proj_high_near/1.",
         ":- discontiguous is_jump/1.",
         ":- discontiguous is_do_nothing/1.",
         ":- discontiguous is_attack/1.",
+        ":- discontiguous is_duck/1.",
         ":- discontiguous pit_near/1.",
         ":- discontiguous enemy_near/1.",
         ":- discontiguous enemy_attackable/1.",
+        ":- discontiguous proj_near/1.",
+        ":- discontiguous proj_attackable/1.",
         "",
         "% distance buckets",
         "near(D) :- integer(D), D =< 3.",
@@ -303,27 +339,37 @@ def write_task(
         "pit_near(S) :- gap_dist(S,D), near(D).",
         "enemy_near(S) :- enemy_dist(S,D), near(D).",
         "enemy_attackable(S) :- enemy_dist(S,1).",
+        "proj_near(S) :- projectile_dist(S,D), near(D).",
+        "proj_attackable(S) :- projectile_dist(S,1).",
+        "proj_low_near(S) :- proj_low(S), proj_near(S).",
+        "proj_high_near(S) :- proj_high(S), proj_near(S).",
         "",
         "% action identity facts",
         "is_jump(jump).",
         "is_do_nothing(do_nothing).",
         "is_attack(attack).",
+        "is_duck(duck).",
         "",
-
     ]
 
-    # IMPORTANT FIX:
-    # Do NOT emit enemy_dist/gap_dist facts when nothing is in view.
-    # Previously you wrote enemy_dist(S,99). gap_dist(S,99). for "none",
-    # which makes enemy_dist/2 and gap_dist/2 true for ALL states.
+    # Don't emit *_dist(S,99) facts (99 means 'out of view')
     for sid, feats in bk.items():
         ed = feats["enemy_dist"]
         gd = feats["gap_dist"]
+        pd = feats["projectile_dist"]
 
         if ed != 99:
             lines.append(f"enemy_dist({sid},{ed}).")
         if gd != 99:
             lines.append(f"gap_dist({sid},{gd}).")
+        if pd != 99:
+            lines.append(f"projectile_dist({sid},{pd}).")
+
+        # projectile type facts
+        if feats.get("projectile_low", False):
+            lines.append(f"proj_low({sid}).")
+        if feats.get("projectile_high", False):
+            lines.append(f"proj_high({sid}).")
 
         lines.append(
             f"on_ground({sid},{'true' if feats['on_ground'] else 'false'}).")
@@ -379,16 +425,8 @@ def main() -> None:
     ap.add_argument("--overwrite_bias", action="store_true",
                     help="Overwrite ilp/bias.pl if it exists")
 
-    ap.add_argument(
-        "--label_best_action",
-        action="store_true",
-        help="Label positives as the best immediate-reward action(s) per state (recommended).",
-    )
-    ap.add_argument(
-        "--no_label_best_action",
-        action="store_true",
-        help="Disable best-action labeling and use reward>0 for one random action per state (noisier).",
-    )
+    ap.add_argument("--label_best_action", action="store_true")
+    ap.add_argument("--no_label_best_action", action="store_true")
 
     ap.add_argument("--run_popper", action="store_true")
     ap.add_argument("--noisy", action="store_true",
